@@ -1,10 +1,14 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+
+import 'services/measurement_sync_service.dart';
 
 enum _AppLanguage { tr, zh, en, es, ru, fr }
 
@@ -277,7 +281,13 @@ const Map<_AppLanguage, Map<String, String>> _i18n = {
   },
 };
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (!kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS)) {
+    await MobileAds.instance.initialize();
+  }
   runApp(const DuzlemOlcerApp());
 }
 
@@ -337,6 +347,10 @@ class _BubbleLevelPageState extends State<BubbleLevelPage> {
   bool _showUsageInfo = true;
   bool _soundSignalEnabled = true;
   int _lastSignalTimestampMs = 0;
+  MeasurementSyncService? _measurementSyncService;
+  BannerAd? _topBannerAd;
+  bool _isTopBannerLoaded = false;
+  int _lastMeasurementSyncAtMs = 0;
   _AppLanguage _language = _AppLanguage.en;
   _ReferenceMode _referenceMode = _ReferenceMode.auto;
   _ViewMode _viewMode = _ViewMode.level;
@@ -448,17 +462,89 @@ class _BubbleLevelPageState extends State<BubbleLevelPage> {
     _savePreferencesInBackground();
   }
 
+  bool get _supportsBannerAds =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS);
+
+  String? get _bannerAdUnitId {
+    if (!_supportsBannerAds) {
+      return null;
+    }
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return 'ca-app-pub-3940256099942544/6300978111';
+    }
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      return 'ca-app-pub-3940256099942544/2934735716';
+    }
+    return null;
+  }
+
+  void _loadTopBannerAd() {
+    final adUnitId = _bannerAdUnitId;
+    if (adUnitId == null) {
+      return;
+    }
+
+    _topBannerAd?.dispose();
+    _topBannerAd = BannerAd(
+      adUnitId: adUnitId,
+      request: const AdRequest(),
+      size: AdSize.banner,
+      listener: BannerAdListener(
+        onAdLoaded: (ad) {
+          if (!mounted) {
+            ad.dispose();
+            return;
+          }
+          setState(() {
+            _topBannerAd = ad as BannerAd;
+            _isTopBannerLoaded = true;
+          });
+        },
+        onAdFailedToLoad: (ad, error) {
+          ad.dispose();
+          if (!mounted) {
+            return;
+          }
+          setState(() {
+            _topBannerAd = null;
+            _isTopBannerLoaded = false;
+          });
+        },
+      ),
+    )..load();
+  }
+
   @override
   void initState() {
     super.initState();
     unawaited(_loadPreferences());
+    unawaited(_initMeasurementSync());
+    _loadTopBannerAd();
     _accelerometerSub = accelerometerEventStream().listen(_onSensorUpdate);
   }
 
   @override
   void dispose() {
     _accelerometerSub?.cancel();
+    _measurementSyncService?.dispose();
+    _topBannerAd?.dispose();
     super.dispose();
+  }
+
+  Future<void> _initMeasurementSync() async {
+    final prefs = await SharedPreferences.getInstance();
+    final service = MeasurementSyncService(prefs: prefs);
+    service.startAutoRetry();
+    await service.flushPending();
+
+    if (!mounted) {
+      service.dispose();
+      return;
+    }
+
+    _measurementSyncService = service;
   }
 
   void _onSensorUpdate(AccelerometerEvent event) {
@@ -498,6 +584,11 @@ class _BubbleLevelPageState extends State<BubbleLevelPage> {
     _maybePlaySoundSignal(
       wasLevel: hadLevel,
       isLevel: nextIsLevel,
+      hasSensorData: hasSensorData,
+    );
+    _enqueueMeasurementForSync(
+      roll: nextRoll,
+      pitch: nextPitch,
       hasSensorData: hasSensorData,
     );
   }
@@ -610,6 +701,34 @@ class _BubbleLevelPageState extends State<BubbleLevelPage> {
     }
     _lastSignalTimestampMs = now;
     unawaited(SystemSound.play(SystemSoundType.alert));
+  }
+
+  void _enqueueMeasurementForSync({
+    required double roll,
+    required double pitch,
+    required bool hasSensorData,
+  }) {
+    final syncService = _measurementSyncService;
+    if (syncService == null || !hasSensorData) {
+      return;
+    }
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastMeasurementSyncAtMs < 1500) {
+      return;
+    }
+    _lastMeasurementSyncAtMs = now;
+
+    final projected = _projectAngles(roll, pitch);
+    final mode = _viewMode == _ViewMode.level ? 'level' : 'plumb';
+
+    unawaited(
+      syncService.enqueueMeasurement(
+        angleX: double.parse(projected.$1.toStringAsFixed(2)),
+        angleY: double.parse(projected.$2.toStringAsFixed(2)),
+        mode: mode,
+      ),
+    );
   }
 
   void _savePreferencesInBackground() {
@@ -972,6 +1091,10 @@ class _BubbleLevelPageState extends State<BubbleLevelPage> {
     final projected = _projectAngles(_roll, _pitch);
     final displayX = projected.$1;
     final displayY = projected.$2;
+    final hasTopBanner = _isTopBannerLoaded && _topBannerAd != null;
+    final topBannerHeight = hasTopBanner
+        ? _topBannerAd!.size.height.toDouble()
+        : 0.0;
     final xNorm = (displayX / _fullScaleAngle).clamp(-1.0, 1.0);
     final yNorm = (displayY / _fullScaleAngle).clamp(-1.0, 1.0);
     final bubbleColor = _isLevel
@@ -983,117 +1106,144 @@ class _BubbleLevelPageState extends State<BubbleLevelPage> {
       body: Stack(
         children: [
           SafeArea(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final panelWidth = math.max(
-                  0.0,
-                  math.min(540.0, constraints.maxWidth - 28),
-                );
-                final centerHeight = math.max(
-                  220.0,
-                  math.min(constraints.maxHeight * 0.42, 380.0),
-                );
+            child: Padding(
+              padding: EdgeInsets.only(
+                top: hasTopBanner ? topBannerHeight + 12 : 0,
+              ),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final panelWidth = math.max(
+                    0.0,
+                    math.min(540.0, constraints.maxWidth - 28),
+                  );
+                  final centerHeight = math.max(
+                    220.0,
+                    math.min(constraints.maxHeight * 0.42, 380.0),
+                  );
 
-                return SingleChildScrollView(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 20,
-                  ),
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      minHeight: constraints.maxHeight - 40,
+                  return SingleChildScrollView(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 20,
                     ),
-                    child: _viewMode == _ViewMode.level
-                        ? Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              SizedBox(
-                                width: panelWidth,
-                                child: _HorizontalVial(
-                                  xNorm: xNorm,
-                                  bubbleColor: bubbleColor,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        minHeight: constraints.maxHeight - 40,
+                      ),
+                      child: _viewMode == _ViewMode.level
+                          ? Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(
+                                  width: panelWidth,
+                                  child: _HorizontalVial(
+                                    xNorm: xNorm,
+                                    bubbleColor: bubbleColor,
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 20),
-                              SizedBox(
-                                width: panelWidth,
-                                child: Row(
-                                  crossAxisAlignment: CrossAxisAlignment.center,
-                                  children: [
-                                    _VerticalVial(
-                                      yNorm: yNorm,
-                                      height: centerHeight,
-                                      bubbleColor: bubbleColor,
-                                    ),
-                                    const SizedBox(width: 18),
-                                    Expanded(
-                                      child: AspectRatio(
-                                        aspectRatio: 1,
-                                        child: _CircularLevel(
-                                          xNorm: xNorm,
-                                          yNorm: yNorm,
-                                          bubbleColor: bubbleColor,
+                                const SizedBox(height: 20),
+                                SizedBox(
+                                  width: panelWidth,
+                                  child: Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.center,
+                                    children: [
+                                      _VerticalVial(
+                                        yNorm: yNorm,
+                                        height: centerHeight,
+                                        bubbleColor: bubbleColor,
+                                      ),
+                                      const SizedBox(width: 18),
+                                      Expanded(
+                                        child: AspectRatio(
+                                          aspectRatio: 1,
+                                          child: _CircularLevel(
+                                            xNorm: xNorm,
+                                            yNorm: yNorm,
+                                            bubbleColor: bubbleColor,
+                                          ),
                                         ),
                                       ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(height: 26),
+                                GestureDetector(
+                                  onLongPress: _calibrate,
+                                  onDoubleTap: _clearCalibration,
+                                  child: _ValuePanel(x: displayX, y: displayY),
+                                ),
+                                if (_showUsageInfo && _hasSensorData) ...[
+                                  const SizedBox(height: 10),
+                                  Text(
+                                    _t('hint_controls'),
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.52,
+                                      ),
+                                      fontSize: 12,
                                     ),
-                                  ],
-                                ),
-                              ),
-                              const SizedBox(height: 26),
-                              GestureDetector(
-                                onLongPress: _calibrate,
-                                onDoubleTap: _clearCalibration,
-                                child: _ValuePanel(x: displayX, y: displayY),
-                              ),
-                              if (_showUsageInfo && _hasSensorData) ...[
-                                const SizedBox(height: 10),
-                                Text(
-                                  _t('hint_controls'),
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                    color: Colors.white.withValues(alpha: 0.52),
-                                    fontSize: 12,
+                                  ),
+                                ],
+                              ],
+                            )
+                          : Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(
+                                  width: panelWidth,
+                                  height: math.max(300, centerHeight + 40),
+                                  child: _PlumbModeView(
+                                    xNorm: xNorm,
+                                    angle: displayX,
+                                    bubbleColor: bubbleColor,
                                   ),
                                 ),
-                              ],
-                            ],
-                          )
-                        : Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              SizedBox(
-                                width: panelWidth,
-                                height: math.max(300, centerHeight + 40),
-                                child: _PlumbModeView(
-                                  xNorm: xNorm,
-                                  angle: displayX,
-                                  bubbleColor: bubbleColor,
+                                const SizedBox(height: 20),
+                                GestureDetector(
+                                  onLongPress: _calibrate,
+                                  onDoubleTap: _clearCalibration,
+                                  child: _ValuePanel(x: displayX, y: displayY),
                                 ),
-                              ),
-                              const SizedBox(height: 20),
-                              GestureDetector(
-                                onLongPress: _calibrate,
-                                onDoubleTap: _clearCalibration,
-                                child: _ValuePanel(x: displayX, y: displayY),
-                              ),
-                              if (_showUsageInfo && _hasSensorData) ...[
-                                const SizedBox(height: 10),
-                                Text(
-                                  _t('hint_controls'),
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                    color: Colors.white.withValues(alpha: 0.52),
-                                    fontSize: 12,
+                                if (_showUsageInfo && _hasSensorData) ...[
+                                  const SizedBox(height: 10),
+                                  Text(
+                                    _t('hint_controls'),
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.52,
+                                      ),
+                                      fontSize: 12,
+                                    ),
                                   ),
-                                ),
+                                ],
                               ],
-                            ],
-                          ),
-                  ),
-                );
-              },
+                            ),
+                    ),
+                  );
+                },
+              ),
             ),
           ),
+          if (hasTopBanner)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: SafeArea(
+                bottom: false,
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: SizedBox(
+                    width: _topBannerAd!.size.width.toDouble(),
+                    height: topBannerHeight,
+                    child: AdWidget(ad: _topBannerAd!),
+                  ),
+                ),
+              ),
+            ),
           Positioned(
             left: 14,
             bottom: 14,
